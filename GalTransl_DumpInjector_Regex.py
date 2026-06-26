@@ -14,7 +14,7 @@ import configparser
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Match
 
-VERSION = "1.3.2"
+VERSION = "1.3.1"
 
 # ==============================================================================
 # 全局日志配置
