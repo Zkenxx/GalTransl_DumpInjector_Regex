@@ -1,358 +1,337 @@
+import json
 import os
 import re
-import json
 import shutil
-import logging
+import argparse
+import configparser
+from typing import Dict, List, Tuple, Optional
 
-# 初始化日志配置
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.StreamHandler()
-    ],
-)
+VERSION = "1.2 (CLI Modular Single-File Mode)"
 
 
-def load_char_replacement_table(filepath, filter_chars=""):
-    """
-    读取字符替换表，返回替换字典。
-    :param filepath: 替换表文件路径，格式要求为：原字符\t替代字符
-    :param filter_chars: 仅替换该字符串内的字符，空表示全部
-    :return: 替换字典 {原字符: 替代字符}
-    """
-    replacement_dict = {}
-    try:
-        with open(filepath, "r", encoding="utf-8") as file:
-            for line in file:
-                line = line.strip()
-                if not line:
+# ==============================================================================
+# 1. 文本映射与回调模块 (Translation Mapper)
+# ==============================================================================
+class TranslationMapper:
+    """负责管理原文与译文的字典映射，并提供正则替换的回调方法"""
+    
+    def __init__(self):
+        self.message_dict: Dict[str, str] = {}
+        self.name_dict: Dict[str, str] = {}
+
+    def reset(self):
+        """清空映射字典"""
+        self.message_dict.clear()
+        self.name_dict.clear()
+
+    def get_cn_message_callback(self, matched: re.Match) -> str:
+        """re.sub 的正文替换回调函数"""
+        target_text = matched.group(1)
+        if target_text in self.message_dict:
+            return matched.group().replace(target_text, self.message_dict[target_text])
+        return matched.group()
+
+    def get_cn_name_callback(self, matched: re.Match) -> str:
+        """re.sub 的人名替换回调函数"""
+        target_text = matched.group(1)
+        if target_text in self.name_dict:
+            return matched.group().replace(target_text, self.name_dict[target_text])
+        return matched.group()
+
+
+# ==============================================================================
+# 2. 字库兼容编码模块 (SJIS Proxy Encoder)
+# ==============================================================================
+class SjisProxyEncoder:
+    """负责处理老旧引擎的 Shift-JIS 汉字字库不兼容问题（汉字映射/安全替换）"""
+
+    @staticmethod
+    def read_proxy_dict(filename: str, proxy_words: str = "") -> Dict[str, str]:
+        """读取汉字到日文汉字（Kanji）的映射表"""
+        char_dict = {}
+        if not os.path.exists(filename):
+            print(f"警告: 映射表文件 [{filename}] 不存在，跳过字符替换。")
+            return char_dict
+
+        with open(filename, "r", encoding="utf-8") as f:
+            for line in f.readlines():
+                line_str = line.strip()
+                if not line_str or "\t" not in line_str:
                     continue
-                parts = line.split("\t")
-                if len(parts) != 2:
-                    logging.warning(f"跳过格式不符合的行: {line}")
-                    continue
-                orig_char, replace_char = parts
-                if filter_chars:
-                    if orig_char in filter_chars:
-                        replacement_dict[orig_char] = replace_char
+                orig_char, replace_char = line_str.split("\t", 1)
+                if proxy_words:
+                    if orig_char in proxy_words:
+                        char_dict[orig_char] = replace_char
                 else:
-                    replacement_dict[orig_char] = replace_char
-    except FileNotFoundError:
-        logging.error(f"替换表文件不存在: {filepath}")
-        raise
-    except Exception as ex:
-        logging.error(f"读取替换表出错: {ex}")
-        raise
-    logging.info(f"读取替换表完成，替换字符数: {len(replacement_dict)}")
-    return replacement_dict
+                    char_dict[orig_char] = replace_char
+        return char_dict
+
+    @classmethod
+    def process_sjis_replace(cls, json_cn_folder: str, replace_str: str) -> Tuple[str, List[str], List[str]]:
+        """执行 SJIS 替换模式，生成替换后的临时译文 JSON 目录"""
+        char_dict = cls.read_proxy_dict("hanzi2kanji_table.txt", replace_str)
+        hanzi_chars_list: List[str] = []
+        kanji_chars_list: List[str] = []
+        
+        trans_json_replaced_folder = json_cn_folder + "_replaced"
+        if not os.path.exists(trans_json_replaced_folder):
+            os.mkdir(trans_json_replaced_folder)
+            
+        for file_name in os.listdir(json_cn_folder):
+            if not file_name.endswith(".json"):
+                continue
+            file_path = os.path.join(json_cn_folder, file_name)
+            replaced_file_path = os.path.join(trans_json_replaced_folder, file_name)
+            
+            with open(file_path, "r", encoding="utf-8") as f_in:
+                input_str = f_in.read()
+
+            output_str = ""
+            for char in input_str:
+                if char in char_dict:
+                    output_str += char_dict[char]
+                    if char not in hanzi_chars_list:
+                        hanzi_chars_list.append(char)
+                        kanji_chars_list.append(char_dict[char])
+                else:
+                    output_str += char
+
+            with open(replaced_file_path, "w", encoding="utf-8") as f_out:
+                f_out.write(output_str)
+                
+        return trans_json_replaced_folder, hanzi_chars_list, kanji_chars_list
 
 
-def apply_char_replacement_to_json_folder(src_json_folder, filter_chars=""):
-    """
-    将指定json目录内所有文件内容的字符按替换表替换，生成替换后目录。
-    :param src_json_folder: 源json文件夹路径
-    :param filter_chars: 限制替换的原字符集合，空表示替换全部
-    :return: 新目录路径, 替换的原字符列表, 替换后的字符列表
-    """
-    replacement_table_path = "hanzi2kanji_table.txt"
-    replacement_dict = load_char_replacement_table(replacement_table_path, filter_chars)
+# ==============================================================================
+# 3. 核心业务引擎模块 (GalTransl Engine)
+# ==============================================================================
+class GalTranslEngine:
+    """封装提取与注入的核心业务逻辑"""
 
-    replaced_json_folder = f"{src_json_folder}_replaced"
-    if not os.path.exists(replaced_json_folder):
-        os.makedirs(replaced_json_folder)
+    def __init__(self):
+        self.mapper = TranslationMapper()
 
-    original_chars_used = []
-    replaced_chars_used = []
+    def extract_workflow(self, script_jp_folder: str, json_jp_folder: str, 
+                         regex: str, name_regex: Optional[str], japanese_encoding: str) -> bool:
+        """文本提取核心流"""
+        if not script_jp_folder or not json_jp_folder:
+            print("错误: 请提供日文脚本目录和日文JSON保存目录.")
+            return False
+        if not regex:
+            print("错误: 正文提取正则不能为空.")
+            return False
 
-    file_names = os.listdir(src_json_folder)
-    for file_name in file_names:
-        src_file_path = os.path.join(src_json_folder, file_name)
-        dest_file_path = os.path.join(replaced_json_folder, file_name)
+        message_pattern = re.compile(regex)
+        name_pattern = re.compile(name_regex) if name_regex else None
 
-        if not os.path.isfile(src_file_path):
-            logging.debug(f"跳过非文件: {src_file_path}")
-            continue
+        if not os.path.exists(json_jp_folder):
+            os.makedirs(json_jp_folder)
 
-        try:
-            with open(src_file_path, "r", encoding="utf-8") as f_in:
-                content = f_in.read()
-        except Exception as e:
-            logging.error(f"读取文件失败 {src_file_path}: {e}")
-            continue
-
-        replaced_content_chars = []
-        for ch in content:
-            if ch in replacement_dict:
-                replaced_content_chars.append(replacement_dict[ch])
-                if ch not in original_chars_used:
-                    original_chars_used.append(ch)
-                    replaced_chars_used.append(replacement_dict[ch])
-            else:
-                replaced_content_chars.append(ch)
-
-        replaced_content = "".join(replaced_content_chars)
-
-        try:
-            with open(dest_file_path, "w", encoding="utf-8") as f_out:
-                f_out.write(replaced_content)
-        except Exception as e:
-            logging.error(f"写入文件失败 {dest_file_path}: {e}")
-            continue
-
-    logging.info(f"完成所有文件替换，输出目录: {replaced_json_folder}")
-    return replaced_json_folder, original_chars_used, replaced_chars_used
-
-
-def replace_message_callback(match_obj, replacement_dict):
-    """
-    正文替换回调函数。
-    :param match_obj: regex匹配对象
-    :param replacement_dict: 替换字典，键是原文，值是译文
-    :return: 替换后的字符串或原字符串
-    """
-    orig_text = match_obj.group(1)
-    if orig_text in replacement_dict:
-        return match_obj.group().replace(orig_text, replacement_dict[orig_text])
-    return match_obj.group()
-
-
-def replace_name_callback(match_obj, name_replacement_dict):
-    """
-    人名替换回调函数。
-    :param match_obj: regex匹配对象
-    :param name_replacement_dict: 人名替换字典
-    :return: 替换后字符串或原字符串
-    """
-    orig_name = match_obj.group(1)
-    if orig_name in name_replacement_dict:
-        return match_obj.group().replace(orig_name, name_replacement_dict[orig_name])
-    return match_obj.group()
-
-
-def extract_texts_from_scripts(
-    jp_script_folder,
-    output_json_folder,
-    main_regex_pattern,
-    name_regex_pattern="",
-    encoding="sjis",
-):
-    """
-    根据正则表达式，从日文脚本目录提取文本信息保存成json文件。
-    :param jp_script_folder: 日文脚本目录
-    :param output_json_folder: json保存目录
-    :param main_regex_pattern: 正文提取正则，字符串形式，必须包含捕获组
-    :param name_regex_pattern: 人名提取正则，可选，字符串形式
-    :param encoding: 脚本文件编码，默认sjis
-    """
-    if not os.path.exists(jp_script_folder):
-        raise FileNotFoundError(f"日文脚本目录不存在: {jp_script_folder}")
-    if not os.path.exists(output_json_folder):
-        os.makedirs(output_json_folder)
-
-    main_pattern = re.compile(main_regex_pattern)
-    name_pattern = re.compile(name_regex_pattern) if name_regex_pattern else None
-
-    for filename in os.listdir(jp_script_folder):
-        file_path = os.path.join(jp_script_folder, filename)
-        if not os.path.isfile(file_path):
-            continue
-
-        try:
-            with open(file_path, "r", encoding=encoding) as f:
-                script_text = f.read()
-        except UnicodeDecodeError as e:
-            logging.error(f"{filename}解码失败: {e}")
-            raise
-        except Exception as e:
-            logging.error(f"{filename}读取失败: {e}")
-            continue
-
-        extracted_items = []
-        search_pos = 0
-        while True:
-            match = main_pattern.search(script_text, pos=search_pos)
-            if not match:
-                break
-
+        for filename in os.listdir(script_jp_folder):
+            print(f"正在提取: {filename}")
+            message_list = []
+            script_path = os.path.join(script_jp_folder, filename)
+            
             try:
-                message_text = match.group(1)
-            except IndexError:
-                raise ValueError("正文正则表达式需包含捕获括号")
+                with open(script_path, "r", encoding=japanese_encoding) as f:
+                    text = f.read()
+            except UnicodeDecodeError:
+                print(f"错误: 日文脚本 [{filename}] 编码解码错误")
+                return False
 
-            # 名字识别：从上一次匹配结束处查找到当前正文开始处，匹配人名正则
-            name_text = ""
-            if name_pattern:
-                name_match = name_pattern.search(script_text, search_pos, match.start(1))
-                if name_match:
-                    try:
-                        name_text = name_match.group(1)
-                    except IndexError:
-                        raise ValueError("人名正则表达式需包含捕获括号")
+            search_result = message_pattern.search(text)
+            last_start = 0
+            while search_result:
+                try:
+                    message = search_result.group(1)
+                except IndexError:
+                    print("错误: 正文提取正则表达式未包含括号(Group 1)")
+                    return False
+                    
+                start = search_result.start(1)
+                name = ""
+                if name_regex and name_pattern:
+                    name_search_result = name_pattern.search(text, last_start, start)
+                    if name_search_result:
+                        try:
+                            name = name_search_result.group(1)
+                        except IndexError:
+                            print("错误: 人名提取正则表达式未包含括号(Group 1)")
+                            return False
 
-            extracted_obj = {"message": message_text}
-            if name_text:
-                extracted_obj["name"] = name_text
+                tmp_obj = {"name": name, "message": message}
+                if name == "":
+                    del tmp_obj["name"]
+                message_list.append(tmp_obj)
+                
+                last_start = search_result.end(1)
+                search_result = message_pattern.search(text, last_start)
 
-            extracted_items.append(extracted_obj)
-            search_pos = match.end(1)
+            out_json_path = os.path.join(json_jp_folder, os.path.splitext(filename)[0] + ".json")
+            with open(out_json_path, "w", encoding="utf-8") as f:
+                json.dump(message_list, f, ensure_ascii=False, indent=4)
+                
+        print("----- 提取完毕 -----")
+        return True
 
-        output_json_path = os.path.join(output_json_folder, os.path.splitext(filename)[0] + ".json")
-        try:
-            with open(output_json_path, "w", encoding="utf-8") as f_out:
-                json.dump(extracted_items, f_out, ensure_ascii=False, indent=4)
-            logging.info(f"成功提取并保存：{output_json_path}, 条数: {len(extracted_items)}")
-        except Exception as e:
-            logging.error(f"保存json出错 {output_json_path}: {e}")
+    def insert_workflow(self, script_jp_folder: str, json_jp_folder: str, json_cn_folder: str, 
+                         script_cn_folder: str, jp_encoding: str, cn_encoding: str, 
+                         message_regex: str, name_regex: str, 
+                         sjis_replace_mode: bool, sjis_replace_char: str) -> bool:
+        """文本注入核心流"""
+        if not script_jp_folder or not json_jp_folder or not json_cn_folder or not script_cn_folder:
+            print("错误: 请确保提供日文脚本目录、日文JSON目录、译文JSON目录和译文脚本保存目录.")
+            return False
+        if not message_regex:
+            print("错误: 正文提取正则不能为空.")
+            return False
+
+        if not os.path.exists(script_cn_folder):
+            os.makedirs(script_cn_folder)
+
+        self.mapper.reset()
+        hanzi_chars_list: List[str] = []
+        kanji_chars_list: List[str] = []
+        
+        # 预处理：字库安全替换模式
+        if sjis_replace_mode:
+            json_cn_folder, hanzi_chars_list, kanji_chars_list = SjisProxyEncoder.process_sjis_replace(
+                json_cn_folder, sjis_replace_char
+            )
+            print("sjis替换模式配置:\n")
+            print(f'"source_characters":"{"".join(kanji_chars_list)}",\n')
+            print(f'"target_characters":"{"".join(hanzi_chars_list)}"\n')
+
+        # 遍历注入
+        for filename in os.listdir(script_jp_folder):
+            print(f"正在注入: {filename}")
+            script_path = os.path.join(script_jp_folder, filename)
+            jp_json_path = os.path.join(json_jp_folder, os.path.splitext(filename)[0] + ".json")
+            cn_json_path = os.path.join(json_cn_folder, os.path.splitext(filename)[0] + ".json")
+            
+            # 严格保留原版逻辑：JSON不存在则直接复制原文文件
+            if not os.path.exists(jp_json_path) or not os.path.exists(cn_json_path):
+                shutil.copy(script_path, script_cn_folder)
+                continue
+                
+            with open(jp_json_path, "r", encoding="utf-8") as f:
+                jp_data = json.load(f)
+            with open(cn_json_path, "r", encoding="utf-8") as f:
+                cn_data = json.load(f)
+
+            # 累加映射字典
+            for i in range(min(len(jp_data), len(cn_data))):
+                self.mapper.message_dict[jp_data[i]["message"]] = cn_data[i]["message"]
+                if name_regex != "":
+                    if "name" in jp_data[i] and "name" in cn_data[i]:
+                        if jp_data[i]["name"] not in self.mapper.name_dict:
+                            self.mapper.name_dict[jp_data[i]["name"]] = cn_data[i]["name"]
+
+            with open(script_path, "r", encoding=jp_encoding, errors="ignore") as f:
+                script_content = f.read()
+
+            # 执行注入替换
+            script_content = re.sub(message_regex, self.mapper.get_cn_message_callback, script_content)
+            if name_regex != "":
+                script_content = re.sub(name_regex, self.mapper.get_cn_name_callback, script_content)
+
+            output_path = os.path.join(script_cn_folder, filename)
+            with open(output_path, "w", encoding=cn_encoding, errors="ignore") as f:
+                f.write(script_content)
+
+        if sjis_replace_mode:
+            print("sjis替换模式配置:\n")
+            print(f'"source_characters":"{"".join(kanji_chars_list)}",\n')
+            print(f'"target_characters":"{"".join(hanzi_chars_list)}"\n')
+            
+        print("----- 注入完毕 -----")
+        return True
 
 
-def insert_translation_to_scripts(
-    jp_script_folder,
-    jp_json_folder,
-    cn_json_folder,
-    output_cn_script_folder,
-    main_regex_pattern,
-    name_regex_pattern="",
-    jp_encoding="sjis",
-    cn_encoding="gbk",
-    enable_sjis_replacement=False,
-    sjis_replacement_chars=""
-):
-    """
-    将中文翻译内容注入回脚本，根据json对应替换。
-    :param jp_script_folder: 原始日文脚本目录
-    :param jp_json_folder: 日文提取json目录
-    :param cn_json_folder: 中文翻译json目录
-    :param output_cn_script_folder: 中文脚本输出目录
-    :param main_regex_pattern: 正文匹配正则字符串，必须包含捕获组
-    :param name_regex_pattern: 人名匹配正则字符串，可选
-    :param jp_encoding: 日文脚本编码
-    :param cn_encoding: 中文脚本编码
-    :param enable_sjis_replacement: 是否对中文json文本做替换操作
-    :param sjis_replacement_chars: 要替换的原字符集合，空表示全部替换
-    :return: 如果启用替换，返回替换字符映射字典，否则返回空dict
-    """
-    if not os.path.exists(jp_script_folder):
-        raise FileNotFoundError(f"日文脚本目录不存在: {jp_script_folder}")
-    if not os.path.exists(jp_json_folder):
-        raise FileNotFoundError(f"日文json目录不存在: {jp_json_folder}")
-    if not os.path.exists(cn_json_folder):
-        raise FileNotFoundError(f"中文译文json目录不存在: {cn_json_folder}")
-    if not os.path.exists(output_cn_script_folder):
-        os.makedirs(output_cn_script_folder)
-    if not main_regex_pattern:
-        raise ValueError("请输入有效的正则表达式")
+# ==============================================================================
+# 4. 配置与命令行生命周期模块 (CLI Application)
+# ==============================================================================
+class CLIApplication:
+    """管理配置文件的读取、CLI 参数解析以及程序的入口调度"""
 
-    # 对中文json做字符替换处理，避免部分字符无法编码或显示
-    if enable_sjis_replacement:
-        cn_json_folder, replaced_orig_chars, replaced_target_chars = apply_char_replacement_to_json_folder(
-            cn_json_folder, sjis_replacement_chars
-        )
-    else:
-        replaced_orig_chars, replaced_target_chars = [], []
-
-    message_replacements = {}
-    name_replacements = {}
-    main_pattern = re.compile(main_regex_pattern)
-    name_pattern = re.compile(name_regex_pattern) if name_regex_pattern else None
-
-    for filename in os.listdir(jp_script_folder):
-        jp_script_path = os.path.join(jp_script_folder, filename)
-        if not os.path.isfile(jp_script_path):
-            continue
-
-        jp_json_path = os.path.join(jp_json_folder, os.path.splitext(filename)[0] + ".json")
-        cn_json_path = os.path.join(cn_json_folder, os.path.splitext(filename)[0] + ".json")
-
-        # 缺少json则直接复制文件，跳过翻译替换
-        if not os.path.exists(jp_json_path) or not os.path.exists(cn_json_path):
-            shutil.copy(jp_script_path, os.path.join(output_cn_script_folder, filename))
-            logging.warning(f"缺少对应json，直接复制文件: {filename}")
-            continue
-
-        try:
-            with open(jp_json_path, "r", encoding="utf-8") as f_jp_json:
-                jp_entries = json.load(f_jp_json)
-            with open(cn_json_path, "r", encoding="utf-8") as f_cn_json:
-                cn_entries = json.load(f_cn_json)
-        except Exception as e:
-            logging.error(f"加载json失败 {filename}: {e}")
-            shutil.copy(jp_script_path, os.path.join(output_cn_script_folder, filename))
-            continue
-
-        # 校验日文与中文json条目数是否一致
-        if len(jp_entries) != len(cn_entries):
-            logging.error(f"文件条目数不匹配，跳过替换: {filename}，日文条目{len(jp_entries)}，中文条目{len(cn_entries)}")
-            shutil.copy(jp_script_path, os.path.join(output_cn_script_folder, filename))
-            continue
-
-        # 构建正文与人名替换字典
-        for i in range(len(jp_entries)):
-            jp_msg = jp_entries[i].get("message", "")
-            cn_msg = cn_entries[i].get("message", "")
-            message_replacements[jp_msg] = cn_msg
-
-            if name_pattern:
-                jp_name = jp_entries[i].get("name", "")
-                cn_name = cn_entries[i].get("name", "")
-                if jp_name and cn_name and (jp_name not in name_replacements):
-                    name_replacements[jp_name] = cn_name
-
-        # 读取原始脚本
-        try:
-            with open(jp_script_path, "r", encoding=jp_encoding, errors="ignore") as f_script:
-                script_content = f_script.read()
-        except Exception as e:
-            logging.error(f"读取脚本失败 {filename}: {e}")
-            continue
-
-        # 正文替换
-        script_content = main_pattern.sub(lambda m: replace_message_callback(m, message_replacements), script_content)
-
-        # 如果有名字正则，则替换人名
-        if name_pattern:
-            script_content = name_pattern.sub(lambda m: replace_name_callback(m, name_replacements), script_content)
-
-        # 写入替换后的中文脚本
-        out_script_path = os.path.join(output_cn_script_folder, filename)
-        try:
-            with open(out_script_path, "w", encoding=cn_encoding, errors="ignore") as f_out:
-                f_out.write(script_content)
-            logging.info(f"脚本写入成功: {out_script_path}")
-        except Exception as e:
-            logging.error(f"写入中文脚本失败 {filename}: {e}")
-
-    if enable_sjis_replacement:
-        return {
-            "source_characters": "".join(replaced_orig_chars),
-            "target_characters": "".join(replaced_target_chars),
+    def __init__(self):
+        self.engine = GalTranslEngine()
+        self.defaults = {
+            "script_jp_folder": "",
+            "json_jp_folder": "",
+            "json_cn_folder": "",
+            "script_cn_folder": "",
+            "regex": r"",
+            "name_regex": r"",
+            "japanese_encoding": "shift",
+            "chinese_encoding": "gbk",
         }
-    else:
-        return {}
+
+    def load_ini_config(self, config_path: str = "config.ini"):
+        """加载 INI 配置文件覆盖硬编码缺省值"""
+        if os.path.exists(config_path):
+            config = configparser.ConfigParser()
+            config.read(config_path)
+            if "DEFAULT" in config:
+                for key in self.defaults.keys():
+                    if key in config["DEFAULT"]:
+                        self.defaults[key] = config["DEFAULT"][key]
+
+    def parse_arguments(self) -> argparse.Namespace:
+        """解析命令行参数"""
+        parser = argparse.ArgumentParser(description="正则表达式模式 文本提取与注入工具 (面向对象模块化版)")
+        parser.add_argument("action", choices=["extract", "insert"], help="选择操作: extract (提取) 或 insert (注入)")
+        
+        # 目录路径参数
+        parser.add_argument("--script_jp_folder", default=self.defaults["script_jp_folder"], help="日文脚本文件夹")
+        parser.add_argument("--json_jp_folder", default=self.defaults["json_jp_folder"], help="日文JSON保存文件夹")
+        parser.add_argument("--json_cn_folder", default=self.defaults["json_cn_folder"], help="译文JSON文件夹")
+        parser.add_argument("--script_cn_folder", default=self.defaults["script_cn_folder"], help="译文脚本保存文件夹")
+        
+        # 正则参数
+        parser.add_argument("--regex", default=self.defaults["regex"], help="正文提取正则")
+        parser.add_argument("--name_regex", default=self.defaults["name_regex"], help="人名提取正则")
+        
+        # 编码/特定优化参数
+        parser.add_argument("--jp_encoding", default=self.defaults["japanese_encoding"], help="日文脚本编码")
+        parser.add_argument("--cn_encoding", default=self.defaults["chinese_encoding"], help="中文脚本编码")
+        parser.add_argument("--sjis_replace_mode", action="store_true", help="启用 SJIS 替换模式注入")
+        parser.add_argument("--sjis_replace_char", default="", help="要替换的字符(留空为全量替换)")
+
+        return parser.parse_args()
+
+    def run(self):
+        """生命周期主入口"""
+        print(f"GalTransl 正则提取注入工具 {VERSION} by zkenxx")
+        self.load_ini_config()
+        args = self.parse_arguments()
+
+        if args.action == "extract":
+            self.engine.extract_workflow(
+                script_jp_folder=args.script_jp_folder,
+                json_jp_folder=args.json_jp_folder,
+                regex=args.regex,
+                name_regex=args.name_regex,
+                japanese_encoding=args.jp_encoding
+            )
+        elif args.action == "insert":
+            self.engine.insert_workflow(
+                script_jp_folder=args.script_jp_folder,
+                json_jp_folder=args.json_jp_folder,
+                json_cn_folder=args.json_cn_folder,
+                script_cn_folder=args.script_cn_folder,
+                jp_encoding=args.jp_encoding,
+                cn_encoding=args.cn_encoding,
+                message_regex=args.regex,
+                name_regex=args.name_regex,
+                sjis_replace_mode=args.sjis_replace_mode,
+                sjis_replace_char=args.sjis_replace_char
+            )
 
 
+# ==============================================================================
+# 程序启动点
+# ==============================================================================
 if __name__ == "__main__":
-    # 示例调用（请根据实际路径和正则替换）：
-
-    # extract_texts_from_scripts(
-    #     jp_script_folder="path/to/jp_scripts",
-    #     output_json_folder="path/to/output_jp_json",
-    #     main_regex_pattern=r"your_main_regex",
-    #     name_regex_pattern=r"your_name_regex",
-    #     encoding="sjis"
-    # )
-
-    # insert_translation_to_scripts(
-    #     jp_script_folder="path/to/jp_scripts",
-    #     jp_json_folder="path/to/output_jp_json",
-    #     cn_json_folder="path/to/cn_json",
-    #     output_cn_script_folder="path/to/output_cn_scripts",
-    #     main_regex_pattern=r"your_main_regex",
-    #     name_regex_pattern=r"your_name_regex",
-    #     jp_encoding="sjis",
-    #     cn_encoding="gbk",
-    #     enable_sjis_replacement=True,
-    #     sjis_replacement_chars=""
-    # )
-
-    pass
+    app = CLIApplication()
+    app.run()
