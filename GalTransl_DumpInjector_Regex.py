@@ -295,7 +295,7 @@ class CLIApplication:
         path = Path(config_path)
         if path.exists():
             config = configparser.ConfigParser()
-            config.read(path, encoding="utf-8")
+            config.read(path, encoding="gbk")
             if "DEFAULT" in config:
                 for key in self.defaults.keys():
                     if key in config["DEFAULT"]:
